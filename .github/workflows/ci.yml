@@ -7,6 +7,9 @@ on:
       - main
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -20,6 +23,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -53,10 +58,14 @@ jobs:
     name: Coverage
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    env:
+      MIN_COVERAGE_PERCENT: '45'
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          persist-credentials: false
 
       - name: Set up Flutter
         uses: subosito/flutter-action@v2
@@ -70,15 +79,79 @@ jobs:
       - name: Run Tests with Coverage
         run: flutter test --coverage
 
+      - name: Enforce Minimum Coverage
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ ! -f coverage/lcov.info ]]; then
+            echo "coverage/lcov.info not found."
+            exit 1
+          fi
+
+          total_lines=$(awk -F: '/^LF:/{sum+=$2} END {print sum+0}' coverage/lcov.info)
+          covered_lines=$(awk -F: '/^LH:/{sum+=$2} END {print sum+0}' coverage/lcov.info)
+          if [[ "$total_lines" -eq 0 ]]; then
+            echo "Coverage report contains zero executable lines."
+            exit 1
+          fi
+
+          coverage_percent=$(awk -v covered="$covered_lines" -v total="$total_lines" 'BEGIN { printf "%.2f", (covered/total)*100 }')
+          echo "Line coverage: ${coverage_percent}% (minimum ${MIN_COVERAGE_PERCENT}%)"
+
+          awk -v actual="$coverage_percent" -v minimum="$MIN_COVERAGE_PERCENT" \
+            'BEGIN { exit(actual+0 < minimum+0 ? 1 : 0) }' || {
+              echo "Coverage gate failed: ${coverage_percent}% < ${MIN_COVERAGE_PERCENT}%"
+              exit 1
+            }
+
       - name: Upload Coverage Artifact
         uses: actions/upload-artifact@v4
         with:
           name: coverage-lcov
           path: coverage/lcov.info
 
+      - name: Validate Codecov Token
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        shell: bash
+        run: |
+          if [[ -z "${{ secrets.CODECOV_TOKEN }}" ]]; then
+            echo "Missing CODECOV_TOKEN secret. Configure it in repository settings."
+            exit 1
+          fi
+
       - name: Upload Coverage to Codecov
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
         uses: codecov/codecov-action@v5
         with:
           files: coverage/lcov.info
           token: ${{ secrets.CODECOV_TOKEN }}
-          fail_ci_if_error: false
+          fail_ci_if_error: true
+
+  firestore-security:
+    name: Firestore Security Rules
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Security Test Dependencies
+        run: npm ci
+
+      - name: Run Firestore Rules Tests
+        run: npm run test:firestore:emulator
