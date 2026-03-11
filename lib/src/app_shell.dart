@@ -40,95 +40,247 @@ class LandingScreen extends StatelessWidget {
       animation: engine,
       builder: (context, _) {
         return Scaffold(
-          appBar: AppBar(
-            title: const Text('Party Queue MVP'),
-            centerTitle: true,
-          ),
+          backgroundColor: const Color(0xFF07090F),
           body: SafeArea(
-            child: Padding(
-              padding: const EdgeInsets.all(20),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.stretch,
-                children: [
-                  Card(
-                    child: Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Text(
-                        'Host erstellt einen Raum und steuert Spotify. '
-                        'Gäste joinen per Code, Link oder QR und voten/adden Songs. '
-                        'Queue ordnet sich dynamisch nach deinen Regeln.',
-                        style: Theme.of(context).textTheme.bodyLarge,
-                      ),
-                    ),
+            child: Stack(
+              children: [
+                const Positioned(
+                  top: -120,
+                  right: -80,
+                  child: _GlowOrb(size: 300),
+                ),
+                const Positioned(
+                  bottom: -140,
+                  left: -120,
+                  child: _GlowOrb(size: 320),
+                ),
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 24,
+                    vertical: 28,
                   ),
-                  const SizedBox(height: 10),
-                  Card(
-                    color: engine.realtimeAvailable
-                        ? Theme.of(context).colorScheme.primaryContainer
-                        : Theme.of(context).colorScheme.secondaryContainer,
-                    child: Padding(
-                      padding: const EdgeInsets.all(12),
-                      child: Text(
-                        engine.realtimeAvailable
-                            ? 'Firebase Realtime Sync ist aktiv. Mehrgeraete-Raeume sind verfuegbar.'
-                            : 'Firebase ist aktuell nicht konfiguriert. App laeuft im lokalen Demo-Modus.',
-                      ),
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  FilledButton.icon(
-                    onPressed: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => HostSetupScreen(engine: engine),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const SizedBox(height: 10),
+                      Center(
+                        child: Container(
+                          width: 110,
+                          height: 110,
+                          decoration: BoxDecoration(
+                            color: const Color(0xFFF6F4FF),
+                            borderRadius: BorderRadius.circular(24),
+                            border: Border.all(
+                              color: const Color(0xFF7A3DF3),
+                              width: 4,
+                            ),
+                            boxShadow: const [
+                              BoxShadow(
+                                color: Color(0x557A3DF3),
+                                blurRadius: 26,
+                                spreadRadius: 2,
+                              ),
+                            ],
+                          ),
+                          alignment: Alignment.center,
+                          child: const Text(
+                            'Logo',
+                            style: TextStyle(
+                              color: Color(0xFF13151B),
+                              fontWeight: FontWeight.w800,
+                              fontSize: 28,
+                            ),
+                          ),
                         ),
-                      );
-                    },
-                    icon: const Icon(Icons.home_work_outlined),
-                    label: const Text('Party hosten'),
-                  ),
-                  const SizedBox(height: 10),
-                  OutlinedButton.icon(
-                    onPressed: () {
-                      Navigator.of(context).push(
-                        MaterialPageRoute(
-                          builder: (_) => JoinSetupScreen(engine: engine),
+                      ),
+                      const SizedBox(height: 28),
+                      Text(
+                        'Party Queue',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.headlineMedium
+                            ?.copyWith(
+                              color: Colors.white,
+                              fontWeight: FontWeight.w800,
+                              letterSpacing: -0.3,
+                            ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Host erstellt einen Raum. Gaeste joinen in Sekunden.',
+                        textAlign: TextAlign.center,
+                        style: Theme.of(context).textTheme.bodyMedium?.copyWith(
+                          color: const Color(0xFFB9BCD0),
                         ),
-                      );
-                    },
-                    icon: const Icon(Icons.group_add_outlined),
-                    label: const Text('Party beitreten'),
-                  ),
-                  if (engine.canSmartRejoin) ...[
-                    const SizedBox(height: 10),
-                    TextButton.icon(
-                      onPressed: () {
-                        final result = engine.smartRejoin();
-                        showActionSnackBar(context, result);
-                        if (result.success) {
+                      ),
+                      const SizedBox(height: 24),
+                      _PrimaryActionBar(
+                        label: 'Host',
+                        icon: Icons.home_work_outlined,
+                        onTap: () {
                           Navigator.of(context).push(
                             MaterialPageRoute(
-                              builder: (_) => RoomScreen(engine: engine),
+                              builder: (_) => HostSetupScreen(engine: engine),
                             ),
                           );
-                        }
-                      },
-                      icon: const Icon(Icons.refresh),
-                      label: const Text('Letzte Session wiederherstellen'),
-                    ),
-                  ],
-                  const Spacer(),
-                  Text(
-                    'Spotify ist in dieser ersten Version als integrierte Mock-Schnittstelle umgesetzt. '
-                    'Host-Playback-Reconnect und Device-Fehlerfluss sind vollständig enthalten.',
-                    style: Theme.of(context).textTheme.bodySmall,
+                        },
+                      ),
+                      const SizedBox(height: 12),
+                      _PrimaryActionBar(
+                        label: 'Gast',
+                        icon: Icons.group_add_outlined,
+                        onTap: () {
+                          Navigator.of(context).push(
+                            MaterialPageRoute(
+                              builder: (_) => JoinSetupScreen(engine: engine),
+                            ),
+                          );
+                        },
+                      ),
+                      if (engine.canSmartRejoin) ...[
+                        const SizedBox(height: 8),
+                        TextButton.icon(
+                          onPressed: () {
+                            final result = engine.smartRejoin();
+                            showActionSnackBar(context, result);
+                            if (result.success) {
+                              Navigator.of(context).push(
+                                MaterialPageRoute(
+                                  builder: (_) => RoomScreen(engine: engine),
+                                ),
+                              );
+                            }
+                          },
+                          icon: const Icon(Icons.refresh, color: Colors.white),
+                          label: const Text(
+                            'Letzte Session wiederherstellen',
+                            style: TextStyle(color: Colors.white),
+                          ),
+                        ),
+                      ],
+                      const Spacer(),
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 14,
+                          vertical: 10,
+                        ),
+                        decoration: BoxDecoration(
+                          color: const Color(0xAA111528),
+                          borderRadius: BorderRadius.circular(14),
+                          border: Border.all(color: const Color(0x337A3DF3)),
+                        ),
+                        child: Row(
+                          children: [
+                            Icon(
+                              engine.realtimeAvailable
+                                  ? Icons.cloud_done_outlined
+                                  : Icons.cloud_off_outlined,
+                              color: engine.realtimeAvailable
+                                  ? const Color(0xFF6EE7B7)
+                                  : const Color(0xFFF59E0B),
+                            ),
+                            const SizedBox(width: 10),
+                            Expanded(
+                              child: Text(
+                                engine.realtimeAvailable
+                                    ? 'Realtime Sync aktiv'
+                                    : 'Lokalmodus aktiv',
+                                style: const TextStyle(
+                                  color: Color(0xFFE7E9F4),
+                                  fontWeight: FontWeight.w600,
+                                ),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+              ],
             ),
           ),
         );
       },
+    );
+  }
+}
+
+class _GlowOrb extends StatelessWidget {
+  const _GlowOrb({required this.size});
+
+  final double size;
+
+  @override
+  Widget build(BuildContext context) {
+    return IgnorePointer(
+      child: Container(
+        width: size,
+        height: size,
+        decoration: const BoxDecoration(
+          shape: BoxShape.circle,
+          gradient: RadialGradient(
+            colors: [Color(0x447A3DF3), Color(0x117A3DF3), Color(0x007A3DF3)],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _PrimaryActionBar extends StatelessWidget {
+  const _PrimaryActionBar({
+    required this.label,
+    required this.icon,
+    required this.onTap,
+  });
+
+  final String label;
+  final IconData icon;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    return Material(
+      color: Colors.transparent,
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(16),
+        child: Ink(
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(16),
+            gradient: const LinearGradient(
+              begin: Alignment.centerLeft,
+              end: Alignment.centerRight,
+              colors: [Color(0xFF5B2CD4), Color(0xFF7A3DF3)],
+            ),
+            boxShadow: const [
+              BoxShadow(
+                color: Color(0x4D7A3DF3),
+                blurRadius: 16,
+                offset: Offset(0, 6),
+              ),
+            ],
+          ),
+          child: SizedBox(
+            height: 58,
+            child: Row(
+              mainAxisAlignment: MainAxisAlignment.center,
+              children: [
+                Icon(icon, color: Colors.white, size: 20),
+                const SizedBox(width: 10),
+                Text(
+                  label,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontSize: 18,
+                    fontWeight: FontWeight.w700,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -759,6 +911,12 @@ class _HostProfileSetupScreenState extends State<HostProfileSetupScreen> {
   }
 }
 
+enum _JoinStage { access, profile }
+
+enum _JoinAsyncState { idle, loading, error }
+
+enum _JoinAction { verifyAccess, joinRoom }
+
 class JoinSetupScreen extends StatefulWidget {
   const JoinSetupScreen({super.key, required this.engine});
 
@@ -775,9 +933,14 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
     text: 'Gast',
   );
   String _avatar = kAvatarOptions[1];
-  bool _isSubmitting = false;
-  bool _showProfileStep = false;
+  _JoinStage _stage = _JoinStage.access;
+  _JoinAsyncState _asyncState = _JoinAsyncState.idle;
+  _JoinAction _lastAction = _JoinAction.verifyAccess;
+  ActionResult? _lastJoinError;
   String? _roomLookupMessage;
+
+  bool get _isSubmitting => _asyncState == _JoinAsyncState.loading;
+  bool get _showProfileStep => _stage == _JoinStage.profile;
 
   @override
   void dispose() {
@@ -831,6 +994,25 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
               ),
             ),
           ),
+          if (_lastJoinError != null && _asyncState == _JoinAsyncState.error) ...[
+            const SizedBox(height: 10),
+            Card(
+              color: Theme.of(context).colorScheme.errorContainer,
+              child: ListTile(
+                leading: const Icon(Icons.error_outline),
+                title: Text(_lastJoinError!.message),
+                subtitle: Text('Fehlercode: ${_lastJoinError!.code}'),
+                trailing: TextButton(
+                  onPressed: _isSubmitting ? null : _retryLastAction,
+                  child: const Text('Erneut versuchen'),
+                ),
+              ),
+            ),
+          ],
+          if (_isSubmitting) ...[
+            const SizedBox(height: 10),
+            const LinearProgressIndicator(),
+          ],
           if (_showProfileStep) ...[
             const SizedBox(height: 10),
             Card(
@@ -877,7 +1059,11 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
                 onPressed: _isSubmitting
                     ? null
                     : _showProfileStep
-                    ? () => setState(() => _showProfileStep = false)
+                    ? () => setState(() {
+                        _stage = _JoinStage.access;
+                        _asyncState = _JoinAsyncState.idle;
+                        _lastJoinError = null;
+                      })
                     : () async {
                         final raw = await Navigator.of(context).push<String>(
                           MaterialPageRoute(
@@ -915,7 +1101,11 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
   }
 
   Future<void> _verifyRoomAccess() async {
-    setState(() => _isSubmitting = true);
+    setState(() {
+      _asyncState = _JoinAsyncState.loading;
+      _lastAction = _JoinAction.verifyAccess;
+      _lastJoinError = null;
+    });
     final result = widget.engine.realtimeAvailable
         ? await widget.engine.verifyJoinAccessRealtime(
             joinInput: _joinController.text,
@@ -928,18 +1118,31 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
     if (!mounted) {
       return;
     }
-    setState(() => _isSubmitting = false);
+    if (!result.success) {
+      final mappedError = _mapJoinError(result);
+      setState(() {
+        _asyncState = _JoinAsyncState.error;
+        _lastJoinError = mappedError;
+      });
+      showActionSnackBar(context, mappedError);
+      return;
+    }
+    setState(() => _asyncState = _JoinAsyncState.idle);
     showActionSnackBar(context, result);
     if (result.success) {
       setState(() {
         _roomLookupMessage = result.message;
-        _showProfileStep = true;
+        _stage = _JoinStage.profile;
       });
     }
   }
 
   Future<void> _joinNow() async {
-    setState(() => _isSubmitting = true);
+    setState(() {
+      _asyncState = _JoinAsyncState.loading;
+      _lastAction = _JoinAction.joinRoom;
+      _lastJoinError = null;
+    });
     final result = widget.engine.realtimeAvailable
         ? await widget.engine.joinRoomRealtime(
             guestName: _nameController.text,
@@ -956,7 +1159,16 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
     if (!mounted) {
       return;
     }
-    setState(() => _isSubmitting = false);
+    if (!result.success) {
+      final mappedError = _mapJoinError(result);
+      setState(() {
+        _asyncState = _JoinAsyncState.error;
+        _lastJoinError = mappedError;
+      });
+      showActionSnackBar(context, mappedError);
+      return;
+    }
+    setState(() => _asyncState = _JoinAsyncState.idle);
     showActionSnackBar(context, result);
     if (result.success) {
       Navigator.of(context).pushReplacement(
@@ -966,7 +1178,10 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
   }
 
   void _joinAsGuestForTesting() {
-    setState(() => _isSubmitting = true);
+    setState(() {
+      _asyncState = _JoinAsyncState.loading;
+      _lastJoinError = null;
+    });
     final result = widget.engine.joinAsGuestForTesting(
       guestName: _nameController.text,
       guestAvatar: _avatar,
@@ -974,13 +1189,73 @@ class _JoinSetupScreenState extends State<JoinSetupScreen> {
     if (!mounted) {
       return;
     }
-    setState(() => _isSubmitting = false);
+    setState(() => _asyncState = _JoinAsyncState.idle);
     showActionSnackBar(context, result);
     if (result.success) {
       Navigator.of(context).pushReplacement(
         MaterialPageRoute(builder: (_) => RoomScreen(engine: widget.engine)),
       );
     }
+  }
+
+  Future<void> _retryLastAction() async {
+    if (_lastAction == _JoinAction.joinRoom) {
+      await _joinNow();
+      return;
+    }
+    await _verifyRoomAccess();
+  }
+
+  ActionResult _mapJoinError(ActionResult result) {
+    switch (result.code) {
+      case PartyErrorCode.roomPasswordRequired:
+        return ActionResult.fail(
+          'Bitte gib zuerst das Raumpasswort ein.',
+          code: result.code,
+        );
+      case PartyErrorCode.roomPasswordInvalid:
+        return ActionResult.fail(
+          'Das Raumpasswort ist falsch. Bitte pruefe die Eingabe.',
+          code: result.code,
+        );
+      case PartyErrorCode.roomLocked:
+        return ActionResult.fail(
+          'Der Raum ist aktuell gesperrt. Bitte spaeter erneut versuchen.',
+          code: result.code,
+        );
+      case PartyErrorCode.roomEnded:
+        return ActionResult.fail(
+          'Diese Party ist bereits beendet. Bitte einem aktiven Raum beitreten.',
+          code: result.code,
+        );
+      case PartyErrorCode.roomLookupNoActive:
+        return ActionResult.fail(
+          'Kein aktiver Raum gefunden. Bitte Code/Link eingeben oder zuerst als Host starten.',
+          code: result.code,
+        );
+      case PartyErrorCode.roomLookupMultipleActive:
+        return ActionResult.fail(
+          'Mehrere Raeume gefunden. Bitte verwende den exakten Code oder Invite-Link.',
+          code: result.code,
+        );
+      case PartyErrorCode.roomLookupAmbiguous:
+        return ActionResult.fail(
+          'Mehrere Treffer gefunden. Bitte mit Raumcode oder Invite-Link fortfahren.',
+          code: result.code,
+        );
+      case PartyErrorCode.realtimeUnavailable:
+        return ActionResult.fail(
+          'Realtime ist aktuell nicht verfuegbar. Bitte lokal beitreten.',
+          code: result.code,
+        );
+      case PartyErrorCode.realtimeAuthFailed:
+      case PartyErrorCode.realtimeAuthMissingUserId:
+        return ActionResult.fail(
+          'Realtime-Anmeldung fehlgeschlagen. Bitte kurz warten und erneut versuchen.',
+          code: result.code,
+        );
+    }
+    return result;
   }
 }
 

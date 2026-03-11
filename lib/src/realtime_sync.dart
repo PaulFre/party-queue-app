@@ -2,13 +2,18 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 
 class RealtimeResult {
-  const RealtimeResult({required this.success, required this.message});
+  const RealtimeResult({
+    required this.success,
+    required this.message,
+    this.userId,
+  });
 
   final bool success;
   final String message;
+  final String? userId;
 
-  static RealtimeResult ok(String message) =>
-      RealtimeResult(success: true, message: message);
+  static RealtimeResult ok(String message, {String? userId}) =>
+      RealtimeResult(success: true, message: message, userId: userId);
 
   static RealtimeResult fail(String message) =>
       RealtimeResult(success: false, message: message);
@@ -128,7 +133,10 @@ class PartyRealtimeSync implements PartyRealtimeSyncApi {
       if (_auth.currentUser == null) {
         await _auth.signInAnonymously();
       }
-      return RealtimeResult.ok('Realtime auth verbunden.');
+      return RealtimeResult.ok(
+        'Realtime auth verbunden.',
+        userId: _auth.currentUser?.uid,
+      );
     } catch (_) {
       return RealtimeResult.fail(
         'Firebase Auth fehlgeschlagen. Bitte Firebase Projekt prüfen.',
@@ -151,6 +159,7 @@ class PartyRealtimeSync implements PartyRealtimeSyncApi {
         }
         transaction.set(roomRef, <String, dynamic>{
           'hostUserId': hostUserId,
+          'hostAuthUid': _auth.currentUser?.uid,
           'createdAtMs': DateTime.now().millisecondsSinceEpoch,
           'updatedAtMs': DateTime.now().millisecondsSinceEpoch,
           'state': roomState,

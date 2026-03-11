@@ -1,11 +1,17 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:math';
 
 import 'package:flutter/foundation.dart';
 import 'package:uuid/uuid.dart';
 
+import 'join_input_parser.dart';
 import 'party_codec.dart';
 import 'realtime_sync.dart';
+
+part 'party_queue_policy.dart';
+part 'party_realtime_coordinator.dart';
+part 'party_session_service.dart';
 
 enum PartyRole { host, guest }
 
@@ -18,16 +24,23 @@ enum RoomMode { democratic, suggestionsOnly }
 enum PlaybackConnectionState { connected, tokenExpired, deviceUnavailable }
 
 class ActionResult {
-  const ActionResult({required this.success, required this.message});
+  const ActionResult({
+    required this.success,
+    required this.message,
+    this.code = PartyErrorCode.unknown,
+  });
 
   final bool success;
   final String message;
+  final String code;
 
-  static ActionResult ok(String message) =>
-      ActionResult(success: true, message: message);
+  static ActionResult ok(String message, {String code = PartyErrorCode.ok}) =>
+      ActionResult(success: true, message: message, code: code);
 
-  static ActionResult fail(String message) =>
-      ActionResult(success: false, message: message);
+  static ActionResult fail(
+    String message, {
+    String code = PartyErrorCode.unknown,
+  }) => ActionResult(success: false, message: message, code: code);
 }
 
 class AddEligibility {
@@ -224,6 +237,7 @@ class RoomLookupResult {
     required this.room,
     required this.resolvedCode,
     this.errorMessage,
+    this.errorCode,
   });
 
   const RoomLookupResult.success({
@@ -234,15 +248,18 @@ class RoomLookupResult {
   const RoomLookupResult.error({
     required String errorMessage,
     required String resolvedCode,
+    String? errorCode,
   }) : this._(
          room: null,
          resolvedCode: resolvedCode,
          errorMessage: errorMessage,
+         errorCode: errorCode,
        );
 
   final PartyRoom? room;
   final String resolvedCode;
   final String? errorMessage;
+  final String? errorCode;
 
   bool get isSuccess => room != null && errorMessage == null;
 }
@@ -623,13 +640,21 @@ class PartyEngine extends ChangeNotifier {
   PartyEngine({
     MockSpotifyCatalogService? catalog,
     PartyRealtimeSyncApi? realtimeSync,
+    bool verboseTelemetryLogs = false,
   }) : _catalog = catalog ?? MockSpotifyCatalogService(),
-       _realtimeSync = realtimeSync {
+       _realtimeSync = realtimeSync,
+       _verboseTelemetryLogs = verboseTelemetryLogs {
     _ticker = Timer.periodic(const Duration(seconds: 1), _onTick);
   }
 
   final MockSpotifyCatalogService _catalog;
   final PartyRealtimeSyncApi? _realtimeSync;
+  final bool _verboseTelemetryLogs;
+  final QueuePolicyService _queuePolicy = QueuePolicyService();
+  final SessionService _sessionService = SessionService();
+  final RealtimeCoordinator _realtimeCoordinator = RealtimeCoordinator();
+  final RealtimeCommandContract _commandContract = RealtimeCommandContract();
+  final List<TelemetryEvent> _telemetryEvents = <TelemetryEvent>[];
   final Map<String, PartyRoom> _roomsByCode = <String, PartyRoom>{};
   final Uuid _uuid = const Uuid();
   final Random _random = Random();
@@ -639,10 +664,6 @@ class PartyEngine extends ChangeNotifier {
 
   PartyRoom? _currentRoom;
   PartyUser? _currentUser;
-  String? _lastSessionRoomCode;
-  PartyUser? _lastSessionUser;
-  bool _lastSessionWasRealtime = false;
-  bool _lastSessionWasHostAuthority = false;
   bool _isRealtimeSession = false;
   bool _isRealtimeHostAuthority = false;
   bool _isApplyingRemoteState = false;
@@ -650,13 +671,14 @@ class PartyEngine extends ChangeNotifier {
   bool _isPublishingState = false;
   bool _queuedStatePublish = false;
   String? _lastSyncError;
-  final Set<String> _processingCommandIds = <String>{};
 
   PartyRoom? get currentRoom => _currentRoom;
   PartyUser? get currentUser => _currentUser;
   bool get realtimeAvailable => _realtimeSync != null;
   bool get isRealtimeSession => _isRealtimeSession;
   String? get lastSyncError => _lastSyncError;
+  List<TelemetryEvent> get recentTelemetry =>
+      List<TelemetryEvent>.unmodifiable(_telemetryEvents);
 
   bool get isHost =>
       _currentRoom != null &&
@@ -669,9 +691,7 @@ class PartyEngine extends ChangeNotifier {
       !_isHandlingRemoteCommand;
 
   bool get canSmartRejoin =>
-      _lastSessionRoomCode != null &&
-      _lastSessionUser != null &&
-      _roomsByCode.containsKey(_lastSessionRoomCode);
+      _sessionService.hasValidSnapshot(_roomsByCode);
 
   List<String> get availableGenres => MockSpotifyCatalogService.allGenres;
 
@@ -680,7 +700,7 @@ class PartyEngine extends ChangeNotifier {
     if (room == null) {
       return const <QueueItem>[];
     }
-    return List<QueueItem>.unmodifiable(_orderedQueue(room));
+    return List<QueueItem>.unmodifiable(_queuePolicy.orderedQueue(room));
   }
 
   List<QueueItem> get topVoted {
@@ -827,26 +847,51 @@ class PartyEngine extends ChangeNotifier {
     required String roomPassword,
     required bool inviteOnly,
     required RoomSettings initialSettings,
+    String? hostUserId,
   }) {
     _detachRealtimeSession();
+    ActionResult result;
     if (!spotifyConnected) {
-      return ActionResult.fail(
+      result = ActionResult.fail(
         'Host muss zuerst Spotify Premium verbinden, bevor ein Raum erstellt wird.',
+        code: 'host_spotify_required',
       );
+      _logTelemetry(
+        category: 'host',
+        action: 'create_room',
+        result: result,
+      );
+      return result;
     }
     final safeName = hostName.trim().isEmpty ? 'Host' : hostName.trim();
     final safeRoomName = roomName.trim();
     if (safeRoomName.isEmpty) {
-      return ActionResult.fail('Bitte gib einen Raumnamen ein.');
+      result = ActionResult.fail(
+        'Bitte gib einen Raumnamen ein.',
+        code: 'room_name_required',
+      );
+      _logTelemetry(
+        category: 'host',
+        action: 'create_room',
+        result: result,
+      );
+      return result;
     }
     final safeRoomPassword = roomPassword.trim();
     if (safeRoomPassword.length < 4) {
-      return ActionResult.fail(
+      result = ActionResult.fail(
         'Bitte gib ein Raumpasswort mit mindestens 4 Zeichen ein.',
+        code: 'room_password_too_short',
       );
+      _logTelemetry(
+        category: 'host',
+        action: 'create_room',
+        result: result,
+      );
+      return result;
     }
     final host = PartyUser(
-      id: _uuid.v4(),
+      id: hostUserId ?? _uuid.v4(),
       name: safeName,
       avatar: hostAvatar,
       role: PartyRole.host,
@@ -870,7 +915,18 @@ class PartyEngine extends ChangeNotifier {
     _currentUser = host;
     _rememberSession(room: room, user: host);
     _emitStateChanged();
-    return ActionResult.ok('Party "$safeRoomName" ($roomCode) wurde erstellt.');
+    result = ActionResult.ok(
+      'Party "$safeRoomName" ($roomCode) wurde erstellt.',
+      code: 'host_room_created',
+    );
+    _logTelemetry(
+      category: 'host',
+      action: 'create_room',
+      result: result,
+      role: PartyRole.host,
+      room: room,
+    );
+    return result;
   }
 
   Future<ActionResult> createRoomRealtime({
@@ -884,9 +940,45 @@ class PartyEngine extends ChangeNotifier {
   }) async {
     final realtimeSync = _realtimeSync;
     if (realtimeSync == null) {
-      return ActionResult.fail(
+      final result = ActionResult.fail(
         'Firebase Realtime ist nicht verfuegbar. Bitte lokal hosten oder Firebase konfigurieren.',
+        code: PartyErrorCode.realtimeUnavailable,
       );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'host_create_room',
+        result: result,
+        role: PartyRole.host,
+      );
+      return result;
+    }
+    final authResult = await realtimeSync.ensureSignedInAnonymously();
+    if (!authResult.success) {
+      final result = ActionResult.fail(
+        authResult.message,
+        code: PartyErrorCode.realtimeAuthFailed,
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'host_create_room',
+        result: result,
+        role: PartyRole.host,
+      );
+      return result;
+    }
+    final authUserId = authResult.userId;
+    if (authUserId == null || authUserId.isEmpty) {
+      final result = ActionResult.fail(
+        'Realtime Auth-ID konnte nicht bestimmt werden.',
+        code: PartyErrorCode.realtimeAuthMissingUserId,
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'host_create_room',
+        result: result,
+        role: PartyRole.host,
+      );
+      return result;
     }
     final localResult = createRoom(
       hostName: hostName,
@@ -896,29 +988,48 @@ class PartyEngine extends ChangeNotifier {
       roomPassword: roomPassword,
       inviteOnly: inviteOnly,
       initialSettings: initialSettings,
+      hostUserId: authUserId,
     );
     if (!localResult.success) {
       return localResult;
     }
     final room = _currentRoom!;
-    final authResult = await realtimeSync.ensureSignedInAnonymously();
-    if (!authResult.success) {
-      return ActionResult.fail(authResult.message);
-    }
     final createResult = await realtimeSync.createRoomState(
       code: room.code,
       hostUserId: room.hostUserId,
       roomState: encodePartyRoom(room),
     );
     if (!createResult.success) {
-      return ActionResult.fail(createResult.message);
+      final result = ActionResult.fail(
+        createResult.message,
+        code: 'realtime_room_create_failed',
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'host_create_room',
+        result: result,
+        role: PartyRole.host,
+        room: room,
+      );
+      return result;
     }
     _isRealtimeSession = true;
     _isRealtimeHostAuthority = true;
     _rememberSession(room: room, user: _currentUser!);
     await _attachRealtimeRoomSubscription(room.code);
     _attachHostCommandListener(room.code);
-    return ActionResult.ok('${localResult.message} Realtime-Sync aktiv.');
+    final result = ActionResult.ok(
+      '${localResult.message} Realtime-Sync aktiv.',
+      code: 'realtime_room_created',
+    );
+    _logTelemetry(
+      category: 'realtime',
+      action: 'host_create_room',
+      result: result,
+      role: PartyRole.host,
+      room: room,
+    );
+    return result;
   }
 
   ActionResult joinAsGuestForTesting({
@@ -974,7 +1085,17 @@ class PartyEngine extends ChangeNotifier {
   }) {
     final lookup = _lookupLocalJoinRoom(joinInput);
     if (!lookup.isSuccess) {
-      return ActionResult.fail(lookup.errorMessage!);
+      final result = ActionResult.fail(
+        lookup.errorMessage!,
+        code: lookup.errorCode ?? PartyErrorCode.roomLookupNotFound,
+      );
+      _logTelemetry(
+        category: 'guest',
+        action: 'verify_join_access_local',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final room = lookup.room!;
     final accessResult = _validateJoinAccess(
@@ -982,11 +1103,27 @@ class PartyEngine extends ChangeNotifier {
       roomPassword: roomPassword,
     );
     if (!accessResult.success) {
+      _logTelemetry(
+        category: 'guest',
+        action: 'verify_join_access_local',
+        result: accessResult,
+        role: PartyRole.guest,
+        room: room,
+      );
       return accessResult;
     }
-    return ActionResult.ok(
+    final result = ActionResult.ok(
       'Raum ${room.roomName} (${lookup.resolvedCode}) gefunden. Jetzt Name und Avatar waehlen.',
+      code: 'join_access_verified',
     );
+    _logTelemetry(
+      category: 'guest',
+      action: 'verify_join_access_local',
+      result: result,
+      role: PartyRole.guest,
+      room: room,
+    );
+    return result;
   }
 
   Future<ActionResult> verifyJoinAccessRealtime({
@@ -995,26 +1132,62 @@ class PartyEngine extends ChangeNotifier {
   }) async {
     final realtimeSync = _realtimeSync;
     if (realtimeSync == null) {
-      return ActionResult.fail(
+      final result = ActionResult.fail(
         'Firebase Realtime ist nicht verfuegbar. Bitte lokal beitreten oder Firebase konfigurieren.',
+        code: PartyErrorCode.realtimeUnavailable,
       );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'verify_join_access',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final authResult = await realtimeSync.ensureSignedInAnonymously();
     if (!authResult.success) {
-      return ActionResult.fail(authResult.message);
+      final result = ActionResult.fail(
+        authResult.message,
+        code: PartyErrorCode.realtimeAuthFailed,
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'verify_join_access',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final normalizedJoinInput = _normalizeJoinInputForRealtime(joinInput);
     if (normalizedJoinInput.isEmpty) {
-      return ActionResult.fail(
+      final result = ActionResult.fail(
         'Kein aktiver Raum gefunden. Erstelle zuerst eine Party oder gib Code/Link ein.',
+        code: PartyErrorCode.roomLookupNoActive,
       );
+      _logTelemetry(
+        category: 'guest',
+        action: 'verify_join_access_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final lookup = await _lookupRealtimeJoinRoom(
       realtimeSync: realtimeSync,
       joinInput: normalizedJoinInput,
     );
     if (!lookup.isSuccess) {
-      return ActionResult.fail(lookup.errorMessage!);
+      final result = ActionResult.fail(
+        lookup.errorMessage!,
+        code: lookup.errorCode ?? PartyErrorCode.roomLookupNotFound,
+      );
+      _logTelemetry(
+        category: 'guest',
+        action: 'verify_join_access_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final room = lookup.room!;
     final accessResult = _validateJoinAccess(
@@ -1022,11 +1195,27 @@ class PartyEngine extends ChangeNotifier {
       roomPassword: roomPassword,
     );
     if (!accessResult.success) {
+      _logTelemetry(
+        category: 'guest',
+        action: 'verify_join_access_realtime',
+        result: accessResult,
+        role: PartyRole.guest,
+        room: room,
+      );
       return accessResult;
     }
-    return ActionResult.ok(
+    final result = ActionResult.ok(
       'Raum ${room.roomName} (${lookup.resolvedCode}) gefunden. Jetzt Name und Avatar waehlen.',
+      code: 'join_access_verified',
     );
+    _logTelemetry(
+      category: 'guest',
+      action: 'verify_join_access_realtime',
+      result: result,
+      role: PartyRole.guest,
+      room: room,
+    );
+    return result;
   }
 
   ActionResult joinRoom({
@@ -1034,11 +1223,22 @@ class PartyEngine extends ChangeNotifier {
     required String guestAvatar,
     required String joinInput,
     required String roomPassword,
+    String? guestUserId,
   }) {
     _detachRealtimeSession();
     final lookup = _lookupLocalJoinRoom(joinInput);
     if (!lookup.isSuccess) {
-      return ActionResult.fail(lookup.errorMessage!);
+      final result = ActionResult.fail(
+        lookup.errorMessage!,
+        code: lookup.errorCode ?? PartyErrorCode.roomLookupNotFound,
+      );
+      _logTelemetry(
+        category: 'guest',
+        action: 'join_room_local',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final room = lookup.room!;
     final accessResult = _validateJoinAccess(
@@ -1046,11 +1246,18 @@ class PartyEngine extends ChangeNotifier {
       roomPassword: roomPassword,
     );
     if (!accessResult.success) {
+      _logTelemetry(
+        category: 'guest',
+        action: 'join_room_local',
+        result: accessResult,
+        role: PartyRole.guest,
+        room: room,
+      );
       return accessResult;
     }
     final safeName = guestName.trim().isEmpty ? 'Gast' : guestName.trim();
     final guest = PartyUser(
-      id: _uuid.v4(),
+      id: guestUserId ?? _uuid.v4(),
       name: safeName,
       avatar: guestAvatar,
       role: PartyRole.guest,
@@ -1060,9 +1267,18 @@ class PartyEngine extends ChangeNotifier {
     _currentUser = guest;
     _rememberSession(room: room, user: guest);
     _emitStateChanged();
-    return ActionResult.ok(
+    final result = ActionResult.ok(
       'Du bist der Party ${room.roomName} (${lookup.resolvedCode}) beigetreten.',
+      code: 'join_room_success',
     );
+    _logTelemetry(
+      category: 'guest',
+      action: 'join_room_local',
+      result: result,
+      role: PartyRole.guest,
+      room: room,
+    );
+    return result;
   }
 
   Future<ActionResult> joinRoomRealtime({
@@ -1073,26 +1289,76 @@ class PartyEngine extends ChangeNotifier {
   }) async {
     final realtimeSync = _realtimeSync;
     if (realtimeSync == null) {
-      return ActionResult.fail(
+      final result = ActionResult.fail(
         'Firebase Realtime ist nicht verfuegbar. Bitte lokal beitreten oder Firebase konfigurieren.',
+        code: PartyErrorCode.realtimeUnavailable,
       );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'join_room_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final authResult = await realtimeSync.ensureSignedInAnonymously();
     if (!authResult.success) {
-      return ActionResult.fail(authResult.message);
+      final result = ActionResult.fail(
+        authResult.message,
+        code: PartyErrorCode.realtimeAuthFailed,
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'join_room_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
+    }
+    final authUserId = authResult.userId;
+    if (authUserId == null || authUserId.isEmpty) {
+      final result = ActionResult.fail(
+        'Realtime Auth-ID konnte nicht bestimmt werden.',
+        code: PartyErrorCode.realtimeAuthMissingUserId,
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'join_room_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final normalizedJoinInput = _normalizeJoinInputForRealtime(joinInput);
     if (normalizedJoinInput.isEmpty) {
-      return ActionResult.fail(
+      final result = ActionResult.fail(
         'Kein aktiver Raum gefunden. Erstelle zuerst eine Party oder gib Code/Link ein.',
+        code: PartyErrorCode.roomLookupNoActive,
       );
+      _logTelemetry(
+        category: 'guest',
+        action: 'join_room_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final lookup = await _lookupRealtimeJoinRoom(
       realtimeSync: realtimeSync,
       joinInput: normalizedJoinInput,
     );
     if (!lookup.isSuccess) {
-      return ActionResult.fail(lookup.errorMessage!);
+      final result = ActionResult.fail(
+        lookup.errorMessage!,
+        code: lookup.errorCode ?? PartyErrorCode.roomLookupNotFound,
+      );
+      _logTelemetry(
+        category: 'guest',
+        action: 'join_room_realtime',
+        result: result,
+        role: PartyRole.guest,
+      );
+      return result;
     }
     final remoteRoom = lookup.room!;
     final accessResult = _validateJoinAccess(
@@ -1100,11 +1366,18 @@ class PartyEngine extends ChangeNotifier {
       roomPassword: roomPassword,
     );
     if (!accessResult.success) {
+      _logTelemetry(
+        category: 'guest',
+        action: 'join_room_realtime',
+        result: accessResult,
+        role: PartyRole.guest,
+        room: remoteRoom,
+      );
       return accessResult;
     }
     final safeName = guestName.trim().isEmpty ? 'Gast' : guestName.trim();
     final guest = PartyUser(
-      id: _uuid.v4(),
+      id: authUserId,
       name: safeName,
       avatar: guestAvatar,
       role: PartyRole.guest,
@@ -1117,47 +1390,67 @@ class PartyEngine extends ChangeNotifier {
     _isRealtimeHostAuthority = false;
     _rememberSession(room: remoteRoom, user: guest);
 
-    final participantResult = await realtimeSync.upsertParticipant(
-      code: remoteRoom.code,
-      participantId: guest.id,
-      participant: encodePartyUser(guest),
-    );
-    if (!participantResult.success) {
-      return ActionResult.fail(participantResult.message);
-    }
-
     await _attachRealtimeRoomSubscription(remoteRoom.code);
+    _queueGuestCommand(RealtimeCommandType.updateProfile, <String, dynamic>{
+      'name': guest.name,
+      'avatar': guest.avatar,
+    });
     _emitStateChanged();
-    return ActionResult.ok(
+    final result = ActionResult.ok(
       'Du bist der Realtime-Party ${remoteRoom.roomName} (${lookup.resolvedCode}) beigetreten.',
+      code: 'join_room_success',
     );
+    _logTelemetry(
+      category: 'realtime',
+      action: 'join_room_realtime',
+      result: result,
+      role: PartyRole.guest,
+      room: remoteRoom,
+    );
+    return result;
   }
 
   ActionResult smartRejoin() {
-    if (!canSmartRejoin) {
+    final snapshot = _sessionService.snapshot;
+    if (!canSmartRejoin || snapshot == null) {
       return ActionResult.fail(
         'Es gibt keine letzte Session zum Wiederverbinden.',
+        code: 'session_rejoin_unavailable',
       );
     }
-    final code = _lastSessionRoomCode!;
+    final code = snapshot.roomCode;
     final room = _roomsByCode[code];
     if (room == null || room.ended) {
-      return ActionResult.fail('Die letzte Session ist nicht mehr verfuegbar.');
+      return ActionResult.fail(
+        'Die letzte Session ist nicht mehr verfuegbar.',
+        code: 'session_room_unavailable',
+      );
     }
-    final user = _lastSessionUser!;
+    final user = snapshot.user;
     room.participants[user.id] = user;
     _currentRoom = room;
     _currentUser = user;
-    if (_lastSessionWasRealtime && _realtimeSync != null) {
+    if (snapshot.wasRealtime && _realtimeSync != null) {
       _isRealtimeSession = true;
-      _isRealtimeHostAuthority = _lastSessionWasHostAuthority;
+      _isRealtimeHostAuthority = snapshot.wasHostAuthority;
       unawaited(_attachRealtimeRoomSubscription(room.code));
       if (_isRealtimeHostAuthority) {
         _attachHostCommandListener(room.code);
       }
     }
     _emitStateChanged();
-    return ActionResult.ok('Letzte Session erfolgreich wieder verbunden.');
+    final result = ActionResult.ok(
+      'Letzte Session erfolgreich wieder verbunden.',
+      code: 'session_rejoin_success',
+    );
+    _logTelemetry(
+      category: 'session',
+      action: 'smart_rejoin',
+      result: result,
+      role: _currentUser?.role,
+      room: room,
+    );
+    return result;
   }
 
   void leaveRoom() {
@@ -1180,16 +1473,17 @@ class PartyEngine extends ChangeNotifier {
     final updated = user.copyWith(name: safeName, avatar: avatar);
     room.participants[user.id] = updated;
     _currentUser = updated;
-    if (_lastSessionUser?.id == updated.id) {
-      _lastSessionUser = updated;
-    }
+    _sessionService.updateRememberedUser(updated);
     _reorderQueue(room);
     _emitStateChanged();
     if (_isRealtimeSession) {
       if (isHost) {
         _publishRealtimeState();
-      } else {
-        _syncParticipantRealtime(updated);
+      } else if (!_isHandlingRemoteCommand) {
+        _queueGuestCommand(RealtimeCommandType.updateProfile, <String, dynamic>{
+          'name': updated.name,
+          'avatar': updated.avatar,
+        });
       }
     }
     return ActionResult.ok('Profil aktualisiert.');
@@ -1210,7 +1504,7 @@ class PartyEngine extends ChangeNotifier {
     final filteredSongs = _filterSongsForCurrentRoom(songs);
     var added = 0;
     for (final song in filteredSongs) {
-      if (_songExists(room: room, songId: song.id)) {
+      if (_queuePolicy.songExists(room: room, songId: song.id)) {
         continue;
       }
       room.queue.add(
@@ -1286,6 +1580,8 @@ class PartyEngine extends ChangeNotifier {
     if (_isRealtimeGuest) {
       _queueGuestCommand(RealtimeCommandType.addSong, <String, dynamic>{
         'song': encodeSong(song),
+        'actorName': user.name,
+        'actorAvatar': user.avatar,
       });
       return ActionResult.ok('Song-Add an Host gesendet.');
     }
@@ -1337,6 +1633,8 @@ class PartyEngine extends ChangeNotifier {
       _queueGuestCommand(RealtimeCommandType.voteSong, <String, dynamic>{
         'queueItemId': queueItemId,
         'vote': vote.name,
+        'actorName': user.name,
+        'actorAvatar': user.avatar,
       });
       return ActionResult.ok('Vote an Host gesendet.');
     }
@@ -1375,7 +1673,7 @@ class PartyEngine extends ChangeNotifier {
       return ActionResult.fail('Vorschlag nicht gefunden.');
     }
     final item = room.suggestions.removeAt(index);
-    if (_songExists(room: room, songId: item.song.id)) {
+    if (_queuePolicy.songExists(room: room, songId: item.song.id)) {
       return ActionResult.fail(
         'Song ist bereits in Queue, Vorschlag verworfen.',
       );
@@ -1658,7 +1956,7 @@ class PartyEngine extends ChangeNotifier {
         remaining <= room.settings.freezeWindow &&
         room.lockedNextSongId == null &&
         room.queue.isNotEmpty) {
-      room.lockedNextSongId = _orderedQueue(room).first.id;
+      room.lockedNextSongId = _queuePolicy.orderedQueue(room).first.id;
     }
 
     if (room.nowPlayingPosition >= current.song.duration) {
@@ -1698,7 +1996,7 @@ class PartyEngine extends ChangeNotifier {
     if (room.nowPlaying != null || room.queue.isEmpty) {
       return;
     }
-    final ordered = _orderedQueue(room);
+    final ordered = _queuePolicy.orderedQueue(room);
     if (ordered.isEmpty) {
       return;
     }
@@ -1710,7 +2008,7 @@ class PartyEngine extends ChangeNotifier {
 
   void _reorderQueue(PartyRoom room) {
     if (room.queue.isNotEmpty) {
-      final sorted = _orderedQueue(room);
+      final sorted = _queuePolicy.orderedQueue(room);
       room.queue
         ..clear()
         ..addAll(sorted);
@@ -1718,83 +2016,6 @@ class PartyEngine extends ChangeNotifier {
     if (room.nowPlaying == null) {
       _ensurePlaybackStarted(room);
     }
-  }
-
-  List<QueueItem> _orderedQueue(PartyRoom room) {
-    final now = DateTime.now();
-    final pinned = room.queue.where((item) => item.pinned).toList();
-    final dynamicItems = room.queue.where((item) => !item.pinned).toList();
-
-    pinned.sort((a, b) {
-      final aPinnedAt = a.pinnedAt ?? a.addedAt;
-      final bPinnedAt = b.pinnedAt ?? b.addedAt;
-      final pinCompare = aPinnedAt.compareTo(bPinnedAt);
-      if (pinCompare != 0) {
-        return pinCompare;
-      }
-      return b.score.compareTo(a.score);
-    });
-
-    dynamicItems.sort((a, b) {
-      final scoreCompare = _rankForOrdering(
-        b,
-        room,
-        now,
-      ).compareTo(_rankForOrdering(a, room, now));
-      if (scoreCompare != 0) {
-        return scoreCompare;
-      }
-      return a.addedAt.compareTo(b.addedAt);
-    });
-
-    final previousAdder =
-        room.nowPlaying?.addedByUserId ?? room.lastPlayedByUserId;
-    final fairItems = room.settings.fairnessMode
-        ? _applyFairness(dynamicItems, previousAdder)
-        : dynamicItems;
-
-    final ordered = <QueueItem>[...pinned, ...fairItems];
-    if (room.lockedNextSongId != null) {
-      final lockIndex = ordered.indexWhere(
-        (item) => item.id == room.lockedNextSongId,
-      );
-      if (lockIndex > 0) {
-        final lockedItem = ordered.removeAt(lockIndex);
-        ordered.insert(0, lockedItem);
-      }
-    }
-    return ordered;
-  }
-
-  double _rankForOrdering(QueueItem item, PartyRoom room, DateTime now) {
-    var score = item.score.toDouble();
-    if (room.settings.sortMode == QueueSortMode.votesWithAgeBoost) {
-      final ageSeconds = now.difference(item.addedAt).inSeconds;
-      score += (ageSeconds / 120).clamp(0, 5);
-    }
-    return score;
-  }
-
-  List<QueueItem> _applyFairness(
-    List<QueueItem> sorted,
-    String? previousAdder,
-  ) {
-    if (sorted.length <= 1) {
-      return sorted;
-    }
-    final pool = List<QueueItem>.from(sorted);
-    final result = <QueueItem>[];
-    var lastAdder = previousAdder;
-    while (pool.isNotEmpty) {
-      final nextIndex = pool.indexWhere(
-        (item) => item.addedByUserId != lastAdder,
-      );
-      final indexToTake = nextIndex == -1 ? 0 : nextIndex;
-      final next = pool.removeAt(indexToTake);
-      result.add(next);
-      lastAdder = next.addedByUserId;
-    }
-    return result;
   }
 
   AddEligibility _checkAddEligibility({
@@ -1824,7 +2045,7 @@ class PartyEngine extends ChangeNotifier {
         'Dieser Song faellt in ein vom Host ausgeschlossenes Genre.',
       );
     }
-    if (_songExists(room: room, songId: song.id)) {
+    if (_queuePolicy.songExists(room: room, songId: song.id)) {
       return AddEligibility.denied(
         'Song ist bereits in der Live-Queue oder laeuft schon.',
       );
@@ -1859,19 +2080,6 @@ class PartyEngine extends ChangeNotifier {
       room.addHistoryByUserId[user.id] = history;
     }
     return AddEligibility.allowedResult;
-  }
-
-  bool _songExists({required PartyRoom room, required String songId}) {
-    if (room.nowPlaying?.song.id == songId) {
-      return true;
-    }
-    if (room.queue.any((item) => item.song.id == songId)) {
-      return true;
-    }
-    if (room.suggestions.any((item) => item.song.id == songId)) {
-      return true;
-    }
-    return false;
   }
 
   ActionResult _updateSettings({
@@ -1942,6 +2150,19 @@ class PartyEngine extends ChangeNotifier {
             if (currentUserId != null) {
               final syncedUser = remoteRoom.participants[currentUserId];
               if (syncedUser == null) {
+                if (_isRealtimeSession && !_isRealtimeHostAuthority) {
+                  final pendingLocalUser = _currentUser;
+                  if (pendingLocalUser != null) {
+                    remoteRoom.participants[pendingLocalUser.id] =
+                        pendingLocalUser;
+                    _currentRoom = remoteRoom;
+                    _lastSyncError = null;
+                    _isApplyingRemoteState = true;
+                    super.notifyListeners();
+                    _isApplyingRemoteState = false;
+                    return;
+                  }
+                }
                 _detachRealtimeSession();
                 _lastSyncError = 'Du wurdest aus dem Raum entfernt.';
                 _currentRoom = null;
@@ -1959,6 +2180,16 @@ class PartyEngine extends ChangeNotifier {
           },
           onError: (_) {
             _lastSyncError = 'Realtime-Listener unterbrochen.';
+            _logTelemetry(
+              category: 'realtime',
+              action: 'room_listener_error',
+              result: ActionResult.fail(
+                _lastSyncError!,
+                code: PartyErrorCode.realtimeListenerInterrupted,
+              ),
+              role: _currentUser?.role,
+              room: _currentRoom,
+            );
             super.notifyListeners();
           },
         );
@@ -1977,33 +2208,91 @@ class PartyEngine extends ChangeNotifier {
         .listen(
           (commands) {
             for (final command in commands) {
-              if (_processingCommandIds.contains(command.id)) {
+              final started = _realtimeCoordinator.tryStartProcessing(
+                roomCode: roomCode,
+                commandId: command.id,
+                now: DateTime.now(),
+              );
+              if (!started) {
                 continue;
               }
-              _processingCommandIds.add(command.id);
               unawaited(
-                _processRealtimeCommand(
-                  command,
-                ).whenComplete(() => _processingCommandIds.remove(command.id)),
+                _processRealtimeCommand(command)
+                    .then((rememberAsProcessed) {
+                      _realtimeCoordinator.finishProcessing(
+                        roomCode: roomCode,
+                        commandId: command.id,
+                        now: DateTime.now(),
+                        rememberAsProcessed: rememberAsProcessed,
+                      );
+                    })
+                    .catchError((_) {
+                      _realtimeCoordinator.finishProcessing(
+                        roomCode: roomCode,
+                        commandId: command.id,
+                        now: DateTime.now(),
+                        rememberAsProcessed: false,
+                      );
+                    }),
               );
             }
           },
           onError: (_) {
             _lastSyncError = 'Command-Listener unterbrochen.';
+            _logTelemetry(
+              category: 'realtime',
+              action: 'command_listener_error',
+              result: ActionResult.fail(
+                _lastSyncError!,
+                code: PartyErrorCode.realtimeCommandListenerInterrupted,
+              ),
+              role: _currentUser?.role,
+              room: _currentRoom,
+            );
             super.notifyListeners();
           },
         );
   }
 
-  Future<void> _processRealtimeCommand(RealtimeCommand command) async {
+  Future<bool> _processRealtimeCommand(RealtimeCommand command) async {
     final room = _currentRoom;
     if (room == null || !_isRealtimeSession || !_isRealtimeHostAuthority) {
-      return;
+      return false;
     }
-    final actor = room.participants[command.userId];
+    final validation = _commandContract.validateIncomingCommand(
+      command,
+      now: DateTime.now(),
+    );
+    if (!validation.isValid) {
+      final invalidResult = ActionResult.fail(
+        validation.message ?? 'Command-Payload ungueltig.',
+        code: validation.code ?? PartyErrorCode.realtimeCommandInvalid,
+      );
+      await _ackRealtimeCommand(
+        roomCode: room.code,
+        commandId: command.id,
+        result: invalidResult,
+      );
+      _logTelemetry(
+        category: 'realtime',
+        action: 'process_command_${command.type.name}',
+        result: invalidResult,
+        role: _currentUser?.role,
+        room: room,
+        metadata: <String, Object?>{
+          'commandId': command.id,
+          'userId': command.userId,
+        },
+      );
+      return true;
+    }
+    final actor = _resolveActorForCommand(room: room, command: command);
     ActionResult result;
     if (actor == null) {
-      result = ActionResult.fail('User nicht im Raum.');
+      result = ActionResult.fail(
+        'User nicht im Raum.',
+        code: PartyErrorCode.realtimeCommandActorMissing,
+      );
     } else {
       final previousUser = _currentUser;
       _currentUser = actor;
@@ -2042,12 +2331,51 @@ class PartyEngine extends ChangeNotifier {
     if (_isRealtimeSession && _isRealtimeHostAuthority) {
       _publishRealtimeState();
     }
-    await _realtimeSync?.markCommandProcessed(
-      code: room.code,
-      commandId: command.id,
-      success: result.success,
-      message: result.message,
+    _logTelemetry(
+      category: 'realtime',
+      action: 'process_command_${command.type.name}',
+      result: result,
+      role: actor?.role,
+      room: room,
+      metadata: <String, Object?>{
+        'commandId': command.id,
+        'userId': command.userId,
+      },
     );
+    return _ackRealtimeCommand(
+      roomCode: room.code,
+      commandId: command.id,
+      result: result,
+    );
+  }
+
+  PartyUser? _resolveActorForCommand({
+    required PartyRoom room,
+    required RealtimeCommand command,
+  }) {
+    final existingActor = room.participants[command.userId];
+    if (existingActor != null) {
+      return existingActor;
+    }
+    final rawName =
+        (command.payload['name'] ?? command.payload['actorName'] ?? '')
+            .toString()
+            .trim();
+    final rawAvatar =
+        (command.payload['avatar'] ?? command.payload['actorAvatar'] ?? '')
+            .toString()
+            .trim();
+    if (rawName.isEmpty && rawAvatar.isEmpty) {
+      return null;
+    }
+    final createdActor = PartyUser(
+      id: command.userId,
+      name: rawName.isEmpty ? 'Gast' : rawName,
+      avatar: rawAvatar.isEmpty ? 'A' : rawAvatar,
+      role: PartyRole.guest,
+    );
+    room.participants[createdActor.id] = createdActor;
+    return createdActor;
   }
 
   void _queueGuestCommand(
@@ -2058,6 +2386,23 @@ class PartyEngine extends ChangeNotifier {
     final user = _currentUser;
     final sync = _realtimeSync;
     if (room == null || user == null || sync == null) {
+      return;
+    }
+    final validation = _commandContract.validateOutgoingPayload(type, payload);
+    if (!validation.isValid) {
+      final failure = ActionResult.fail(
+        validation.message ?? 'Command konnte lokal nicht validiert werden.',
+        code: validation.code ?? PartyErrorCode.realtimeCommandInvalid,
+      );
+      _lastSyncError = failure.message;
+      _logTelemetry(
+        category: 'realtime',
+        action: 'queue_guest_command_${type.name}',
+        result: failure,
+        role: user.role,
+        room: room,
+      );
+      super.notifyListeners();
       return;
     }
     unawaited(
@@ -2071,30 +2416,29 @@ class PartyEngine extends ChangeNotifier {
           .then((result) {
             if (!result.success) {
               _lastSyncError = result.message;
+              _logTelemetry(
+                category: 'realtime',
+                action: 'queue_guest_command_${type.name}',
+                result: ActionResult.fail(
+                  result.message,
+                  code: PartyErrorCode.realtimeGuestCommandEnqueueFailed,
+                ),
+                role: user.role,
+                room: room,
+              );
               super.notifyListeners();
+              return;
             }
-          }),
-    );
-  }
-
-  void _syncParticipantRealtime(PartyUser user) {
-    final room = _currentRoom;
-    final sync = _realtimeSync;
-    if (room == null || sync == null || !_isRealtimeSession) {
-      return;
-    }
-    unawaited(
-      sync
-          .upsertParticipant(
-            code: room.code,
-            participantId: user.id,
-            participant: encodePartyUser(user),
-          )
-          .then((result) {
-            if (!result.success) {
-              _lastSyncError = result.message;
-              super.notifyListeners();
-            }
+            _logTelemetry(
+              category: 'realtime',
+              action: 'queue_guest_command_${type.name}',
+              result: ActionResult.ok(
+                result.message,
+                code: 'realtime_guest_command_enqueued',
+              ),
+              role: user.role,
+              room: room,
+            );
           }),
     );
   }
@@ -2134,7 +2478,7 @@ class PartyEngine extends ChangeNotifier {
     _roomRealtimeSubscription = null;
     _commandSubscription?.cancel();
     _commandSubscription = null;
-    _processingCommandIds.clear();
+    _realtimeCoordinator.reset();
     _isRealtimeSession = false;
     _isRealtimeHostAuthority = false;
     _isApplyingRemoteState = false;
@@ -2142,6 +2486,40 @@ class PartyEngine extends ChangeNotifier {
     _isPublishingState = false;
     _queuedStatePublish = false;
     _lastSyncError = null;
+  }
+
+  Future<bool> _ackRealtimeCommand({
+    required String roomCode,
+    required String commandId,
+    required ActionResult result,
+  }) async {
+    try {
+      await _realtimeSync?.markCommandProcessed(
+        code: roomCode,
+        commandId: commandId,
+        success: result.success,
+        message: result.message,
+      );
+      return true;
+    } catch (_) {
+      _lastSyncError = 'Command-Status konnte nicht bestaetigt werden.';
+      _logTelemetry(
+        category: 'realtime',
+        action: 'command_ack',
+        result: ActionResult.fail(
+          _lastSyncError!,
+          code: PartyErrorCode.realtimeCommandAckFailed,
+        ),
+        role: _currentUser?.role,
+        room: _currentRoom,
+        metadata: <String, Object?>{
+          'commandId': commandId,
+          'resultCode': result.code,
+        },
+      );
+      super.notifyListeners();
+      return false;
+    }
   }
 
   List<Song> _filterSongsForCurrentRoom(List<Song> songs) {
@@ -2169,16 +2547,28 @@ class PartyEngine extends ChangeNotifier {
   }) {
     final safePassword = roomPassword.trim();
     if (safePassword.isEmpty) {
-      return ActionResult.fail('Bitte gib das Raumpasswort ein.');
+      return ActionResult.fail(
+        'Bitte gib das Raumpasswort ein.',
+        code: PartyErrorCode.roomPasswordRequired,
+      );
     }
     if (room.ended) {
-      return ActionResult.fail('Diese Party ist bereits beendet.');
+      return ActionResult.fail(
+        'Diese Party ist bereits beendet.',
+        code: PartyErrorCode.roomEnded,
+      );
     }
     if (room.settings.lockRoom) {
-      return ActionResult.fail('Der Host hat den Raum aktuell gesperrt.');
+      return ActionResult.fail(
+        'Der Host hat den Raum aktuell gesperrt.',
+        code: PartyErrorCode.roomLocked,
+      );
     }
     if (room.roomPassword != safePassword) {
-      return ActionResult.fail('Das Raumpasswort ist falsch.');
+      return ActionResult.fail(
+        'Das Raumpasswort ist falsch.',
+        code: PartyErrorCode.roomPasswordInvalid,
+      );
     }
     return ActionResult.ok('Raumzugriff erlaubt.');
   }
@@ -2194,6 +2584,7 @@ class PartyEngine extends ChangeNotifier {
           errorMessage:
               'Kein aktiver lokaler Raum gefunden. Erstelle zuerst eine Party als Host.',
           resolvedCode: '',
+          errorCode: PartyErrorCode.roomLookupNoActive,
         );
       }
       if (activeRooms.length > 1) {
@@ -2201,6 +2592,7 @@ class PartyEngine extends ChangeNotifier {
           errorMessage:
               'Mehrere lokale Raeume sind aktiv. Bitte Code, Invite-Link oder Party-Name eingeben.',
           resolvedCode: '',
+          errorCode: PartyErrorCode.roomLookupMultipleActive,
         );
       }
       final room = activeRooms.first;
@@ -2221,11 +2613,13 @@ class PartyEngine extends ChangeNotifier {
             errorMessage:
                 'Kein aktiver Raum mit dem Code $resolvedCode gefunden.',
             resolvedCode: resolvedCode,
+            errorCode: PartyErrorCode.roomLookupNotFound,
           );
         }
         return const RoomLookupResult.error(
           errorMessage: 'Kein oeffentlicher Raum mit diesem Namen gefunden.',
           resolvedCode: '',
+          errorCode: PartyErrorCode.roomLookupNotFound,
         );
       }
       if (matches.length > 1) {
@@ -2233,6 +2627,7 @@ class PartyEngine extends ChangeNotifier {
           errorMessage:
               'Mehrere oeffentliche Raeume passen auf den Namen. Bitte nutze Code oder Invite-Link.',
           resolvedCode: '',
+          errorCode: PartyErrorCode.roomLookupAmbiguous,
         );
       }
       room = matches.first;
@@ -2253,6 +2648,7 @@ class PartyEngine extends ChangeNotifier {
           errorMessage:
               'Kein oeffentlicher Realtime-Raum mit diesem Namen gefunden.',
           resolvedCode: '',
+          errorCode: PartyErrorCode.roomLookupNotFound,
         );
       }
       if (matches.length > 1) {
@@ -2260,6 +2656,7 @@ class PartyEngine extends ChangeNotifier {
           errorMessage:
               'Mehrere oeffentliche Realtime-Raeume passen auf den Namen. Bitte nutze Code oder Invite-Link.',
           resolvedCode: '',
+          errorCode: PartyErrorCode.roomLookupAmbiguous,
         );
       }
       code = matches.first.code;
@@ -2276,6 +2673,7 @@ class PartyEngine extends ChangeNotifier {
       return RoomLookupResult.error(
         errorMessage: 'Kein aktiver Realtime-Raum mit Code $code.',
         resolvedCode: code,
+        errorCode: PartyErrorCode.roomLookupNotFound,
       );
     }
     final room = decodePartyRoom(roomState);
@@ -2314,26 +2712,7 @@ class PartyEngine extends ChangeNotifier {
   }
 
   String _extractRoomCode(String input) {
-    final raw = input.trim();
-    if (raw.isEmpty) {
-      return '';
-    }
-    final uri = Uri.tryParse(raw);
-    if (uri != null && uri.pathSegments.isNotEmpty) {
-      final candidate = uri.pathSegments.last.toUpperCase();
-      if (RegExp(r'^[A-Z0-9]{6}$').hasMatch(candidate)) {
-        return candidate;
-      }
-    }
-    final upper = raw.toUpperCase();
-    if (RegExp(r'^[A-Z0-9]{6}$').hasMatch(upper)) {
-      return upper;
-    }
-    final tokenMatch = RegExp(r'\b([A-Za-z0-9]{6})\b').firstMatch(raw);
-    if (tokenMatch != null) {
-      return tokenMatch.group(1)!.toUpperCase();
-    }
-    return '';
+    return extractRoomCode(input);
   }
 
   String _generateRoomCode() {
@@ -2351,9 +2730,40 @@ class PartyEngine extends ChangeNotifier {
   }
 
   void _rememberSession({required PartyRoom room, required PartyUser user}) {
-    _lastSessionRoomCode = room.code;
-    _lastSessionUser = user;
-    _lastSessionWasRealtime = _isRealtimeSession;
-    _lastSessionWasHostAuthority = _isRealtimeHostAuthority;
+    _sessionService.remember(
+      room: room,
+      user: user,
+      isRealtime: _isRealtimeSession,
+      isRealtimeHostAuthority: _isRealtimeHostAuthority,
+    );
+  }
+
+  void _logTelemetry({
+    required String category,
+    required String action,
+    required ActionResult result,
+    PartyRole? role,
+    PartyRoom? room,
+    Map<String, Object?> metadata = const <String, Object?>{},
+  }) {
+    final event = TelemetryEvent(
+      timestamp: DateTime.now(),
+      category: category,
+      action: action,
+      success: result.success,
+      code: result.code,
+      message: result.message,
+      role: role?.name,
+      roomCode: room?.code,
+      metadata: metadata,
+    );
+    _telemetryEvents.add(event);
+    const maxEvents = 300;
+    if (_telemetryEvents.length > maxEvents) {
+      _telemetryEvents.removeRange(0, _telemetryEvents.length - maxEvents);
+    }
+    if (_verboseTelemetryLogs && kDebugMode) {
+      debugPrint('telemetry ${jsonEncode(event.toJson())}');
+    }
   }
 }
