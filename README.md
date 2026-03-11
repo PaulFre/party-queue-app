@@ -124,3 +124,5 @@ If Firebase is missing or init fails, the app still starts and runs in local dem
 
 Spotify search and playback are still mocked in this version.  
 Next step is replacing the mock catalog/playback adapter with real Spotify OAuth + Web API calls while keeping the same room engine and realtime sync flow.
+
+Smoke check on 2026-03-11.

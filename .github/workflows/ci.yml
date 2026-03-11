@@ -77,7 +77,6 @@ jobs:
           path: coverage/lcov.info
 
       - name: Upload Coverage to Codecov
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v5
         with:
           files: coverage/lcov.info
