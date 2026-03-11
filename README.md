@@ -52,6 +52,21 @@ powershell -ExecutionPolicy Bypass -File .\tool\setup_branch_protection.ps1 -Own
 
 Config lives in `.github/branch-protection.json`.
 
+## GitHub Pages Deployment
+
+- Workflow: `.github/workflows/deploy-pages.yml`
+- Trigger: push on `main` or manual run (`workflow_dispatch`)
+- Output: published Flutter Web build on GitHub Pages
+
+One-time repository setup:
+1. GitHub repository `Settings` -> `Pages`
+2. Under `Build and deployment`, set `Source` to `GitHub Actions`
+3. Push to `main` (or run the workflow manually in `Actions`)
+
+The workflow automatically sets Flutter `--base-href`:
+- `"/"` for `<owner>.github.io` repositories
+- `"/<repo-name>/"` for project pages
+
 ## Product Planning Artifacts
 
 - `docs/01_MVP_Scope_Checklist.md`
