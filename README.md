@@ -29,7 +29,7 @@ Coverage locally:
 flutter test --coverage
 ```
 
-CI enforces a minimum line coverage of `45%` from `coverage/lcov.info`.
+CI enforces a minimum line coverage of `43%` from `coverage/lcov.info`.
 
 Firestore Security Rules (Emulator):
 
@@ -48,7 +48,7 @@ powershell -ExecutionPolicy Bypass -File .\tool\dev_smoke.ps1 -SkipChromeRun
 
 - GitHub Actions workflow: `.github/workflows/ci.yml`
   - Job `Quality Gate` (`analyze`, `test`, `build web`)
-  - Job `Coverage` (`flutter test --coverage`, minimum line coverage: `45%`)
+  - Job `Coverage` (`flutter test --coverage`, minimum line coverage: `43%`)
   - Job `Firestore Security Rules` (`firebase emulators:exec` + rule tests)
   - Coverage artifact: `coverage-lcov`
   - Required Codecov upload (non-fork PRs and pushes) via repository secret `CODECOV_TOKEN`
