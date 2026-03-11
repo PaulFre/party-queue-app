@@ -29,6 +29,15 @@ Coverage locally:
 flutter test --coverage
 ```
 
+CI enforces a minimum line coverage of `43%` from `coverage/lcov.info`.
+
+Firestore Security Rules (Emulator):
+
+```bash
+npm install
+npm run test:firestore:emulator
+```
+
 Windows shortcut script:
 
 ```powershell
@@ -39,9 +48,10 @@ powershell -ExecutionPolicy Bypass -File .\tool\dev_smoke.ps1 -SkipChromeRun
 
 - GitHub Actions workflow: `.github/workflows/ci.yml`
   - Job `Quality Gate` (`analyze`, `test`, `build web`)
-  - Job `Coverage` (`flutter test --coverage`)
+  - Job `Coverage` (`flutter test --coverage`, minimum line coverage: `43%`)
+  - Job `Firestore Security Rules` (`firebase emulators:exec` + rule tests)
   - Coverage artifact: `coverage-lcov`
-  - Optional Codecov upload via repository secret `CODECOV_TOKEN`
+  - Required Codecov upload (non-fork PRs and pushes) via repository secret `CODECOV_TOKEN`
 
 To apply branch protection for `main` via API:
 
@@ -134,6 +144,10 @@ If Firebase is missing or init fails, the app still starts and runs in local dem
 - Guest actions are queued in: `party_rooms/{roomCode}/commands`.
 - Host client listens to pending commands, applies business rules, and republishes authoritative room state.
 - All connected clients subscribe to room snapshots for live sync.
+- Command protocol is hardened:
+  - strict payload validation per command type
+  - stale-command rejection (replay protection window)
+  - structured error codes (`ActionResult.code`) and telemetry events (`engine.recentTelemetry`)
 
 ## Technical Note
 

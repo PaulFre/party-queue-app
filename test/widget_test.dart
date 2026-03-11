@@ -11,9 +11,9 @@ void main() {
 
     await tester.pumpWidget(PartyQueueApp(engine: engine));
 
-    expect(find.text('Party Queue MVP'), findsOneWidget);
-    expect(find.text('Party hosten'), findsOneWidget);
-    expect(find.text('Party beitreten'), findsOneWidget);
+    expect(find.text('Party Queue'), findsOneWidget);
+    expect(find.text('Host'), findsOneWidget);
+    expect(find.text('Gast'), findsOneWidget);
 
     await tester.pumpWidget(const SizedBox.shrink());
     engine.dispose();

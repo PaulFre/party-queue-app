@@ -1,0 +1,82 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function isSignedIn() {
+      return request.auth != null;
+    }
+
+    function roomDoc(roomCode) {
+      return get(/databases/$(database)/documents/party_rooms/$(roomCode));
+    }
+
+    function isHost(roomCode) {
+      return isSignedIn() &&
+          roomDoc(roomCode).data.hostAuthUid == request.auth.uid;
+    }
+
+    match /party_rooms/{roomCode} {
+      allow read: if isSignedIn();
+
+      allow create: if isSignedIn() &&
+          request.resource.data.keys().hasOnly([
+            'hostUserId',
+            'hostAuthUid',
+            'createdAtMs',
+            'updatedAtMs',
+            'state',
+          ]) &&
+          request.resource.data.hostUserId is string &&
+          request.resource.data.hostAuthUid is string &&
+          request.resource.data.hostAuthUid == request.auth.uid &&
+          request.resource.data.createdAtMs is int &&
+          request.resource.data.updatedAtMs is int &&
+          request.resource.data.state is map &&
+          request.resource.data.state.code == roomCode &&
+          request.resource.data.state.hostUserId ==
+              request.resource.data.hostUserId;
+
+      allow update: if isHost(roomCode) &&
+          request.resource.data.hostUserId == resource.data.hostUserId &&
+          request.resource.data.hostAuthUid == resource.data.hostAuthUid &&
+          request.resource.data.createdAtMs == resource.data.createdAtMs &&
+          request.resource.data.updatedAtMs is int &&
+          request.resource.data.state is map &&
+          request.resource.data.state.code == roomCode &&
+          request.resource.data.state.hostUserId == resource.data.hostUserId;
+
+      allow delete: if false;
+
+      match /commands/{commandId} {
+        allow read: if isSignedIn();
+
+        allow create: if isSignedIn() &&
+            request.resource.data.keys().hasOnly([
+              'type',
+              'userId',
+              'payload',
+              'createdAtMs',
+              'processed',
+            ]) &&
+            request.resource.data.type in ['addSong', 'voteSong', 'updateProfile'] &&
+            request.resource.data.userId is string &&
+            request.resource.data.userId == request.auth.uid &&
+            request.resource.data.payload is map &&
+            request.resource.data.createdAtMs is int &&
+            request.resource.data.processed == false;
+
+        allow update: if isHost(roomCode) &&
+            resource.data.processed == false &&
+            request.resource.data.type == resource.data.type &&
+            request.resource.data.userId == resource.data.userId &&
+            request.resource.data.payload == resource.data.payload &&
+            request.resource.data.createdAtMs == resource.data.createdAtMs &&
+            request.resource.data.processed == true &&
+            request.resource.data.processedAtMs is int &&
+            request.resource.data.resultSuccess is bool &&
+            request.resource.data.resultMessage is string;
+
+        allow delete: if false;
+      }
+    }
+  }
+}
